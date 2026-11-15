@@ -1,0 +1,257 @@
+name: Build APK
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+      - name: Write project
+        run: |
+          mkdir -p app/src/main/java/com/gameboost
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EOF
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "GameBoost"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+            id("com.android.application") version "8.5.2" apply false
+            id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > app/build.gradle.kts <<'EOF'
+          plugins { id("com.android.application"); id("org.jetbrains.kotlin.android") }
+          android {
+            namespace = "com.gameboost"
+            compileSdk = 34
+            defaultConfig { applicationId = "com.gameboost"; minSdk = 26; targetSdk = 34; versionCode = 1; versionName = "1.0" }
+            compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+            kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+            implementation("dev.rikka.shizuku:api:13.1.5")
+            implementation("dev.rikka.shizuku:provider:13.1.5")
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <queries>
+              <intent><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent>
+              <intent><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.HOME"/></intent>
+              <package android:name="moe.shizuku.privileged.api"/>
+            </queries>
+            <application android:label="GameBoost" android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+              <activity android:name=".MainActivity" android:exported="true">
+                <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
+              </activity>
+              <provider android:name="rikka.shizuku.ShizukuProvider" android:authorities="${applicationId}.shizuku" android:multiprocess="false" android:enabled="true" android:exported="true" android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"/>
+            </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/gameboost/MainActivity.kt <<'EOF'
+          package com.gameboost
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.CheckBox
+          import android.widget.SeekBar
+          import android.content.IntentFilter
+          import android.os.BatteryManager
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import rikka.shizuku.Shizuku
+
+          class MainActivity : Activity() {
+            private lateinit var status: TextView
+            private lateinit var log: TextView
+            private var res = 80
+            private var hz = 0
+            private var wholeOn = false
+            private var coolOn = true
+            private val prefs by lazy { getSharedPreferences("p", MODE_PRIVATE) }
+            private val onPerm = Shizuku.OnRequestPermissionResultListener { _, _ -> runOnUiThread { refresh() } }
+            private val onBinder = Shizuku.OnBinderReceivedListener { runOnUiThread { refresh() } }
+            private val anim = listOf("window_animation_scale", "transition_animation_scale", "animator_duration_scale")
+
+            private fun games(): Set<String> = prefs.getStringSet("games", emptySet()) ?: emptySet()
+            private fun say(t: String) = runOnUiThread { log.append(t + "\n") }
+
+            private fun ok(): Boolean = try {
+              Shizuku.pingBinder() && Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+            } catch (e: Throwable) { false }
+
+            private fun refresh() {
+              status.text = when {
+                !Shizuku.pingBinder() -> "Shizuku chưa chạy. Mở Shizuku và bấm Start."
+                Shizuku.checkSelfPermission() != PackageManager.PERMISSION_GRANTED -> "Chưa có quyền. Bấm Cấp quyền Shizuku."
+                else -> "Sẵn sàng. Đã chọn ${games().size} game. Pin ${temp()}°C"
+              }
+            }
+
+            private fun temp(): Double = (registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))?.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) ?: 0) / 10.0
+          
+            private fun applySize(p: Int) {
+              val sz = sh("wm size").lines().firstOrNull { it.startsWith("Physical") }?.substringAfter(":")?.trim()
+              val dn = sh("wm density").lines().firstOrNull { it.startsWith("Physical") }?.substringAfter(":")?.trim()?.toIntOrNull()
+              val wh = sz?.split("x")?.mapNotNull { it.trim().toIntOrNull() }
+              if (wh == null || wh.size != 2 || dn == null) { say("Không đọc được độ phân giải gốc."); return }
+              val w = wh[0] * p / 100 / 2 * 2
+              val h = wh[1] * p / 100 / 2 * 2
+              sh("wm size ${w}x${h}")
+              sh("wm density ${dn * p / 100}")
+              say("Độ phân giải cả màn hình: $p% (${w}x${h})")
+            }
+          
+            private fun stopWatch() { sh("kill \$(cat /data/local/tmp/gb.pid)"); sh("rm -f /data/local/tmp/gb.pid") }
+          
+            private fun startWatch() {
+              val s = "hot=0; while :; do t=\$(dumpsys battery | grep -m1 temperature | tr -dc 0-9); t=\${t:-0}; " +
+                "if [ \$t -ge 410 ] && [ \$hot = 0 ]; then hot=1; settings put system min_refresh_rate 60; settings put system peak_refresh_rate 60; " +
+                "elif [ \$t -le 380 ] && [ \$hot = 1 ]; then hot=0; settings put system min_refresh_rate $hz; settings put system peak_refresh_rate $hz; " +
+                "fi; sleep 10; done"
+              sh("nohup sh -c '" + s + "' >/dev/null 2>&1 & echo \$! > /data/local/tmp/gb.pid")
+              say("Bật giữ mát: về 60 Hz khi pin trên 41°C, trả lại khi dưới 38°C.")
+            }
+          
+            private fun sh(cmd: String): String {
+              val m = Shizuku::class.java.getDeclaredMethod("newProcess", Array<String>::class.java, Array<String>::class.java, String::class.java)
+              m.isAccessible = true
+              val p = m.invoke(null, arrayOf("sh", "-c", "$cmd 2>&1"), null, null) as Process
+              val out = p.inputStream.bufferedReader().readText()
+              p.waitFor()
+              return out.trim()
+            }
+
+            private fun work(f: () -> Unit) {
+              if (!ok()) { say("Chưa có quyền Shizuku."); return }
+              Thread { try { f() } catch (e: Throwable) { say("Lỗi: " + e.message) } }.start()
+            }
+
+            private fun home(): String = packageManager.resolveActivity(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME), 0)?.activityInfo?.packageName ?: ""
+            private fun ime(): String = Settings.Secure.getString(contentResolver, Settings.Secure.DEFAULT_INPUT_METHOD)?.substringBefore('/') ?: ""
+
+            private fun boost() = work {
+              val g = games()
+              if (g.isEmpty()) { say("Hãy chọn game trước."); return@work }
+              val keep = g + setOf(packageName, "moe.shizuku.privileged.api", home(), ime())
+              val apps = sh("pm list packages -3").lines().map { it.removePrefix("package:").trim() }.filter { it.isNotEmpty() && it !in keep }
+              apps.forEach { sh("am force-stop $it") }
+              say("Đã dừng ${apps.size} app nền.")
+              sh("am kill-all")
+              sh("pm trim-caches 999G")
+              say("Đã dọn cache và tiến trình nền.")
+              for (a in anim) sh("settings put global $a 0.5")
+              say("Hoạt ảnh nhanh gấp đôi.")
+              stopWatch()
+              if (wholeOn) applySize(res)
+              if (hz > 0) {
+                sh("settings put system min_refresh_rate $hz")
+                sh("settings put system peak_refresh_rate $hz")
+                say("Tần số quét: $hz Hz")
+              }
+              val snap = ((res + 2) / 5 * 5).coerceIn(30, 90)
+              val ds = if (wholeOn || res >= 95) "" else " --downscale " + "%.2f".format(java.util.Locale.US, snap / 100.0)
+              val fp = if (hz > 0) " --fps $hz" else ""
+              for (p in g) {
+                sh("cmd game mode performance $p")
+                say("Game Mode $p: " + sh("cmd game set --mode 2$ds$fp $p").ifEmpty { "ok" })
+                sh("cmd package compile -m speed-profile -f $p")
+              }
+              if (coolOn && hz > 60) startWatch()
+              say("Xong. Vào game thôi.")
+            }
+
+            private fun undo() = work {
+              for (a in anim) sh("settings put global $a 1.0")
+              stopWatch()
+              sh("wm size reset")
+              sh("wm density reset")
+              sh("settings delete system min_refresh_rate")
+              sh("settings delete system peak_refresh_rate")
+              for (p in games()) sh("cmd game reset $p")
+              say("Đã hoàn tác.")
+            }
+
+            private fun pick() {
+              val pm = packageManager
+              val apps = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+                .map { it.activityInfo.packageName to it.loadLabel(pm).toString() }
+                .filter { it.first != packageName }.distinctBy { it.first }.sortedBy { it.second.lowercase() }
+              val sel = games().toMutableSet()
+              AlertDialog.Builder(this).setTitle("Chọn game")
+                .setMultiChoiceItems(apps.map { it.second }.toTypedArray(), BooleanArray(apps.size) { apps[it].first in sel }) { _, i, c ->
+                  if (c) sel.add(apps[i].first) else sel.remove(apps[i].first)
+                }
+                .setPositiveButton("Lưu") { _, _ -> prefs.edit().putStringSet("games", sel).apply(); refresh() }
+                .setNegativeButton("Huỷ", null).show()
+            }
+
+            override fun onCreate(b: Bundle?) {
+              super.onCreate(b)
+              val pad = (16 * resources.displayMetrics.density).toInt()
+              val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(pad, pad * 2, pad, pad) }
+              status = TextView(this).apply { textSize = 16f }
+              log = TextView(this).apply { textSize = 13f; setTextIsSelectable(true) }
+              col.addView(status)
+              fun btn(t: String, f: () -> Unit): Button { val x = Button(this).apply { text = t; setOnClickListener { f() } }; col.addView(x); return x }
+              btn("Mở Shizuku") { packageManager.getLaunchIntentForPackage("moe.shizuku.privileged.api")?.let { startActivity(it) } }
+              btn("Cấp quyền Shizuku") { try { Shizuku.requestPermission(1) } catch (e: Throwable) { say("Shizuku chưa chạy.") } }
+              btn("Chọn game") { pick() }
+                res = prefs.getInt("res", 80)
+                val rl = TextView(this).apply { text = "Độ phân giải: $res%" }
+                val sb = SeekBar(this).apply {
+                  max = 60; progress = res - 40
+                  setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(s: SeekBar?, v: Int, u: Boolean) { res = v + 40; rl.text = "Độ phân giải: $res%"; prefs.edit().putInt("res", res).apply() }
+                    override fun onStartTrackingTouch(s: SeekBar?) {}
+                    override fun onStopTrackingTouch(s: SeekBar?) {}
+                  })
+                }
+                col.addView(rl); col.addView(sb)
+                col.addView(CheckBox(this).apply { text = "Giảm cho cả màn hình (đúng từng %, mọi game)"; setOnCheckedChangeListener { _, c -> wholeOn = c } })
+                col.addView(CheckBox(this).apply { text = "Giữ mát: tự hạ về 60 Hz khi pin trên 41°C"; isChecked = true; setOnCheckedChangeListener { _, c -> coolOn = c } })
+                val fb = btn("FPS: giữ nguyên") {}
+                fb.setOnClickListener {
+                  val o = arrayOf("Giữ nguyên", "60", "90", "120")
+                  AlertDialog.Builder(this).setTitle("FPS và tần số quét").setItems(o) { _, i -> hz = intArrayOf(0, 60, 90, 120)[i]; fb.text = "FPS: " + o[i] }.show()
+                }
+              btn("Tối ưu trước khi chơi") { boost() }
+              btn("Hoàn tác") { undo() }
+              col.addView(log)
+              setContentView(ScrollView(this).apply { addView(col) })
+              Shizuku.addRequestPermissionResultListener(onPerm)
+              Shizuku.addBinderReceivedListenerSticky(onBinder)
+            }
+
+            override fun onResume() { super.onResume(); refresh() }
+
+            override fun onDestroy() {
+              Shizuku.removeRequestPermissionResultListener(onPerm)
+              Shizuku.removeBinderReceivedListener(onBinder)
+              super.onDestroy()
+            }
+          }
+          EOF
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GameBoost-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
